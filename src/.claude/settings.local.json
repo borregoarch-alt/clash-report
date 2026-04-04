@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction | Format-Table -AutoSize\")",
+      "Bash(powershell -Command \"Get-MpComputerStatus | Select-Object AMServiceEnabled, AntispywareEnabled, AntivirusEnabled, RealTimeProtectionEnabled, AntivirusSignatureLastUpdated, AMProductVersion, NISSignatureLastUpdated, QuickScanAge, FullScanAge | Format-List\")",
+      "Bash(powershell -Command \"Get-MpThreat | Select-Object ThreatName, SeverityID, ActionSuccess, InitialDetectionTime | Format-Table -AutoSize 2>&1 | Select-Object -First 30\")",
+      "Bash(powershell -Command \"Get-MpThreatDetection | Select-Object ThreatID, ActionSuccess, CurrentThreatExecutionStatusID, InitialDetectionTime, LastThreatStatusChangeTime, RemediationTime, Resources | Format-List\")",
+      "Bash(powershell -Command ':*)",
+      "Bash(netstat -ano)",
+      "Bash(findstr LISTENING)",
+      "Bash(tailscale status:*)",
+      "Bash(powershell -Command '$input | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object HostName, DNSName, TailscaleIPs, ExitNode, ExitNodeOption, AdvertisedRoutes | Format-List')",
+      "Bash(npm install:*)"
+    ]
+  }
+}

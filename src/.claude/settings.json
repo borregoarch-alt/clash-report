@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5678/)",
+      "Bash(npx serve:*)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:4173/)",
+      "Bash(gh auth:*)",
+      "Bash(git --version)"
+    ],
+    "additionalDirectories": [
+      "d:\\BIM EDGE SOLUTIONS\\08_WEB\\clash-report"
+    ]
+  }
+}
