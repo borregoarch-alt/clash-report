@@ -1,16 +1,20 @@
 @echo off
-echo Iniciando BIM Clash Report...
+echo Iniciando BIM Edge Clash Report...
 
-REM Iniciar Docker Desktop si no está corriendo
+:: Iniciar Docker Desktop
 start "" "C:\Program Files\Docker\Docker\Docker Desktop.exe"
-timeout /t 20 /nobreak >nul
+echo Esperando Docker Desktop...
+timeout /t 25 /nobreak >nul
 
-REM Levantar n8n
+:: Iniciar n8n
 cd /d C:\Users\borre\Desktop\n8n
 docker --context desktop-linux compose up -d
 
-REM Servir la app en puerto 4173
-cd /d "D:\BIM EDGE SOLUTIONS\08_WEB\clash-report"
-npx serve dist -p 4173
+:: Liberar puerto 4173 si está ocupado
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :4173 ^| findstr LISTENING 2^>nul') do taskkill /PID %%a /F >nul 2>&1
 
-pause
+:: Abrir navegador y servir la app
+cd /d "D:\BIM EDGE SOLUTIONS\08_WEB\clash-report"
+start "" "http://localhost:4173"
+timeout /t 2 /nobreak >nul
+npx serve dist -p 4173
