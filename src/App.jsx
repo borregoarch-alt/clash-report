@@ -1,11 +1,15 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { createClient } from "@supabase/supabase-js";
+import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+
+GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 // ─────────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────────
 const ADMIN_PASSWORD  = "BIMEdge2025!";
-const N8N_WEBHOOK_URL = "http://localhost:5678/webhook/clash-report";
+const N8N_WEBHOOK_URL = "http://localhost:5678/webhook/980163d4-deb4-4ead-b19e-acef8832d79a";
 const APP_PUBLIC_URL  = "https://borregoarch-alt.github.io/clash-report";
 
 const supabase = createClient(
@@ -13,8 +17,10 @@ const supabase = createClient(
   "sb_publishable_z4zsiOwTyFD9PQuIItcqQw_wPHbfHEV"
 );
 
-const STORAGE_REPORT   = "bim_report_v2";
-const STORAGE_COMMENTS = "bim_comments_v2";
+const STORAGE_PROJECTS = "bim_projects_v1";
+const STORAGE_REPORT   = id => `bim_report_v2_${id}`;
+const STORAGE_COMMENTS = id => `bim_comments_v2_${id}`;
+const BUCKET           = "floor-plans";
 
 // ─────────────────────────────────────────────────────────────────
 // DESIGN TOKENS — Industrial Precision
@@ -84,6 +90,7 @@ const DEFAULT_PROJECT = {
   website:"www.bimedgesolutions.com", date:"", cycle:"1",
   observations:"", modelsReviewed:"ARQ, STR, MEP-M, MEP-P, MEP-E",
   recipients:[],
+  floorPlans:[],
 };
 
 const mkClash = () => ({
@@ -92,6 +99,7 @@ const mkClash = () => ({
   description:"", location:"", modelFile:"",
   status:"Open", assignedTo:"", dueDate:"", notes:"",
   screenshot:null,
+  floorPlanId:null, pinX:null, pinY:null,
   _key: Math.random().toString(36).slice(2),
 });
 
@@ -103,6 +111,22 @@ function load(key, def) {
 }
 function save(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+
+async function uploadFloorPlan(file) {
+  // Try to create bucket (no-op if it exists)
+  await supabase.storage.createBucket(BUCKET, { public: true });
+  const path = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+  const { error } = await supabase.storage
+    .from(BUCKET)
+    .upload(path, file, { contentType: "application/pdf", upsert: false });
+  if (error) throw new Error(
+    error.message.includes("bucket")
+      ? `Please create a public bucket named "${BUCKET}" in your Supabase dashboard → Storage.`
+      : error.message
+  );
+  const { data: { publicUrl } } = supabase.storage.from(BUCKET).getPublicUrl(path);
+  return publicUrl;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -330,6 +354,323 @@ function ImgUpload({ value, onChange, height=220 }) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// PDF VIEWER — canvas render + SVG pin overlay
+// ─────────────────────────────────────────────────────────────────
+function PdfViewer({ url, pins = [], onAddPin, interactive = false }) {
+  const canvasRef    = useRef();
+  const containerRef = useRef();
+  const [dims, setDims]       = useState({ w: 0, h: 0 });
+  const [loading, setLoading] = useState(true);
+  const [errMsg, setErrMsg]   = useState(null);
+
+  useEffect(() => {
+    if (!url) return;
+    let cancelled = false;
+    setLoading(true); setErrMsg(null);
+
+    (async () => {
+      try {
+        const pdfDoc = await getDocument({ url }).promise;
+        if (cancelled) { pdfDoc.destroy(); return; }
+
+        const page = await pdfDoc.getPage(1);
+        if (cancelled) { pdfDoc.destroy(); return; }
+
+        const containerW = containerRef.current?.clientWidth || 800;
+        const naturalVp  = page.getViewport({ scale: 1 });
+        const scale      = Math.min(containerW / naturalVp.width, 2.5);
+        const vp         = page.getViewport({ scale });
+
+        const canvas = canvasRef.current;
+        if (!canvas || cancelled) { pdfDoc.destroy(); return; }
+        canvas.width  = vp.width;
+        canvas.height = vp.height;
+        setDims({ w: vp.width, h: vp.height });
+
+        const renderTask = page.render({ canvasContext: canvas.getContext("2d"), viewport: vp });
+        try {
+          await renderTask.promise;
+        } catch (re) {
+          pdfDoc.destroy();
+          return;
+        }
+        if (!cancelled) setLoading(false);
+        else pdfDoc.destroy();
+      } catch (e) {
+        if (!cancelled) { setLoading(false); setErrMsg(e.message); }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [url]);
+
+  const handleClick = e => {
+    if (!interactive || !onAddPin) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    onAddPin({
+      x: (e.clientX - rect.left)  / rect.width,
+      y: (e.clientY - rect.top)   / rect.height,
+    });
+  };
+
+  return (
+    <div ref={containerRef} style={{ position:"relative", display:"block", width:"100%" }}>
+      {loading && (
+        <div style={{ padding:48, textAlign:"center", color:C.onSurfaceFaint, fontFamily:body, fontSize:13 }}>
+          <div style={{ fontSize:32, marginBottom:10, animation:"pulse 1s infinite" }}>📄</div>
+          Loading PDF…
+        </div>
+      )}
+      {errMsg && (
+        <div style={{ padding:20, color:C.error, fontSize:13, fontFamily:body, background:C.errorContainer, borderRadius:10 }}>
+          ⚠ {errMsg}
+        </div>
+      )}
+      <canvas
+        ref={canvasRef}
+        onClick={handleClick}
+        style={{
+          display: loading || errMsg ? "none" : "block",
+          maxWidth: "100%",
+          cursor: interactive ? "crosshair" : "default",
+          borderRadius: 8,
+        }}
+      />
+      {/* SVG pin overlay */}
+      {!loading && !errMsg && dims.w > 0 && (
+        <svg
+          style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", pointerEvents:"none" }}
+          viewBox={`0 0 ${dims.w} ${dims.h}`}
+        >
+          {pins.map((pin, i) => {
+            const px    = pin.x * dims.w;
+            const py    = pin.y * dims.h;
+            const color = PRI[pin.priority]?.dot || "#666";
+            const r     = 16;
+            return (
+              <g key={i}>
+                <circle cx={px} cy={py + 2} r={r} fill="rgba(0,0,0,0.22)" />
+                <circle cx={px} cy={py}     r={r} fill={color} />
+                <text
+                  x={px} y={py}
+                  textAnchor="middle" dominantBaseline="central"
+                  fill="#fff" fontSize={r * 0.72} fontWeight="700"
+                  fontFamily="Inter, sans-serif"
+                >
+                  {pin.clashId}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PIN PICKER MODAL
+// ─────────────────────────────────────────────────────────────────
+function PinPickerModal({ floorPlan, existingPin, clashId, priority, onConfirm, onClose }) {
+  const [pin, setPin] = useState(existingPin || null);
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, background:"rgba(13,28,47,0.65)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      zIndex:999, backdropFilter:"blur(6px)",
+    }}>
+      <div className="fade-up" style={{
+        background:C.surfaceLowest, borderRadius:20,
+        padding:"28px 32px", width:"min(960px, 94vw)",
+        maxHeight:"92vh", overflow:"auto", boxShadow:C.shadowFloat,
+      }}>
+        {/* Header */}
+        <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:8 }}>
+          <div style={{ flex:1 }}>
+            <h3 style={{ margin:0, fontFamily:headline, fontSize:18, fontWeight:800, color:C.onSurface }}>
+              Pin Location — {floorPlan.name}
+            </h3>
+            <p style={{ margin:"4px 0 0", fontFamily:body, fontSize:12, color:C.onSurfaceFaint }}>
+              {pin ? "Pin placed — drag to reposition or click again to move it." : "Click on the plan to place the clash pin."}
+            </p>
+          </div>
+          <div style={{
+            background: PRI[priority]?.bg, color: PRI[priority]?.text,
+            borderRadius:8, padding:"4px 14px", fontFamily:body, fontSize:12, fontWeight:700,
+          }}>
+            {clashId} · {priority}
+          </div>
+        </div>
+
+        {/* Instructions bar */}
+        <div style={{ background:C.surfaceLow, borderRadius:10, padding:"10px 16px", marginBottom:16, display:"flex", alignItems:"center", gap:10 }}>
+          <span style={{ fontSize:18 }}>🎯</span>
+          <span style={{ fontFamily:body, fontSize:13, color:C.onSurfaceMid }}>
+            {pin
+              ? `Pin at X: ${(pin.x*100).toFixed(1)}% — Y: ${(pin.y*100).toFixed(1)}%. Click elsewhere to move it.`
+              : "Click anywhere on the plan to place the pin."}
+          </span>
+          {pin && (
+            <button
+              onClick={() => setPin(null)}
+              style={{ marginLeft:"auto", background:"none", border:"none", color:C.error, cursor:"pointer", fontSize:12, fontFamily:body }}
+            >
+              ✕ Clear pin
+            </button>
+          )}
+        </div>
+
+        {/* PDF Viewer */}
+        <div style={{ borderRadius:12, overflow:"hidden", border:`2px solid ${C.surfaceHigh}` }}>
+          <PdfViewer
+            url={floorPlan.pdfUrl}
+            pins={pin ? [{ ...pin, clashId, priority }] : []}
+            onAddPin={setPin}
+            interactive
+          />
+        </div>
+
+        {/* Actions */}
+        <div style={{ display:"flex", gap:10, marginTop:20 }}>
+          <button
+            onClick={onClose}
+            style={{ flex:1, background:C.surfaceLow, border:"none", borderRadius:10, padding:"12px", color:C.onSurfaceMid, cursor:"pointer", fontWeight:600, fontFamily:headline }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => pin && onConfirm(pin)}
+            disabled={!pin}
+            style={{
+              flex:2, border:"none", borderRadius:10, padding:"12px",
+              background: pin ? C.primaryGrad : C.surfaceHigh,
+              color: pin ? "#fff" : C.onSurfaceFaint,
+              fontWeight:800, cursor: pin ? "pointer" : "default", fontFamily:headline, fontSize:14,
+              transition:"all .2s",
+            }}
+          >
+            {pin ? "✓ Confirm Pin Location" : "Place a pin first"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// FLOOR PLANS TAB
+// ─────────────────────────────────────────────────────────────────
+function FloorPlansTab({ floorPlans, onChange }) {
+  const [name, setName]         = useState("");
+  const [uploading, setUploading] = useState(false);
+  const [errMsg, setErrMsg]     = useState("");
+  const fileRef = useRef();
+
+  const handleFile = async file => {
+    if (!file || file.type !== "application/pdf") { setErrMsg("Select a PDF file."); return; }
+    if (!name.trim()) { setErrMsg("Enter a level name first."); return; }
+    setUploading(true); setErrMsg("");
+    try {
+      const url = await uploadFloorPlan(file);
+      onChange([...floorPlans, { id: Math.random().toString(36).slice(2), name: name.trim(), pdfUrl: url }]);
+      setName("");
+    } catch (e) {
+      setErrMsg(e.message);
+    }
+    setUploading(false);
+  };
+
+  const remove = id => onChange(floorPlans.filter(fp => fp.id !== id));
+
+  const inp = { background:C.surfaceLow, borderRadius:8, padding:"10px 14px", color:C.onSurface, fontSize:13, fontFamily:body, border:"none", width:"100%" };
+
+  return (
+    <div className="fade-up">
+      <h2 style={{ color:C.onSurface, fontSize:28, fontWeight:800, margin:"0 0 6px", letterSpacing:-0.5, fontFamily:headline }}>Floor Plans</h2>
+      <p style={{ color:C.onSurfaceFaint, fontSize:13, fontFamily:body, margin:"0 0 32px" }}>
+        Upload a PDF per level. Then pin clashes to exact locations on each plan.
+      </p>
+
+      {/* Add panel */}
+      <div style={{ background:C.surfaceLowest, borderRadius:16, padding:28, marginBottom:28, boxShadow:C.shadow }}>
+        <h3 style={{ color:C.onSurface, fontSize:16, fontWeight:700, margin:"0 0 16px", fontFamily:headline }}>Add Level Plan</h3>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:12, alignItems:"end" }}>
+          <div>
+            <label style={{ color:C.onSurfaceFaint, fontSize:10, fontWeight:600, letterSpacing:1.5, display:"block", marginBottom:6, fontFamily:body }}>LEVEL NAME</label>
+            <input
+              value={name}
+              onChange={e => { setName(e.target.value); setErrMsg(""); }}
+              onKeyDown={e => e.key === "Enter" && fileRef.current.click()}
+              placeholder="e.g. Ground Floor, Level 2, Roof, Basement"
+              style={inp}
+            />
+          </div>
+          <div>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/pdf"
+              style={{ display:"none" }}
+              onChange={e => handleFile(e.target.files[0])}
+            />
+            <button
+              onClick={() => { if (!name.trim()) { setErrMsg("Enter a level name first."); return; } fileRef.current.click(); }}
+              disabled={uploading}
+              style={{
+                background: uploading ? C.surfaceHigh : C.primaryGrad,
+                border:"none", borderRadius:8, padding:"10px 24px",
+                color: uploading ? C.onSurfaceFaint : "#fff",
+                fontWeight:700, fontSize:13, cursor: uploading ? "default" : "pointer",
+                fontFamily:headline, whiteSpace:"nowrap",
+              }}
+            >
+              {uploading ? "⏳ Uploading…" : "📄 Upload PDF"}
+            </button>
+          </div>
+        </div>
+        {errMsg && (
+          <div style={{ marginTop:10, color:C.error, fontSize:12, fontFamily:body, background:C.errorContainer, borderRadius:8, padding:"8px 12px" }}>
+            ⚠ {errMsg}
+          </div>
+        )}
+        <p style={{ color:C.onSurfaceFaint, fontSize:11, fontFamily:body, marginTop:10, marginBottom:0, lineHeight:1.6 }}>
+          <strong style={{ color:C.onSurfaceMid }}>Note:</strong> Requires a public Supabase Storage bucket named <code>floor-plans</code>.
+          Create it in your Supabase Dashboard → Storage if it doesn't exist yet.
+        </p>
+      </div>
+
+      {/* Plans list */}
+      {floorPlans.length === 0 ? (
+        <div style={{ background:C.surfaceLowest, borderRadius:16, padding:"60px 40px", textAlign:"center", boxShadow:C.shadow }}>
+          <div style={{ fontSize:44, marginBottom:12 }}>🗺</div>
+          <p style={{ color:C.onSurfaceFaint, fontFamily:body }}>No floor plans yet. Add one above.</p>
+        </div>
+      ) : (
+        floorPlans.map(fp => (
+          <div key={fp.id} style={{ background:C.surfaceLowest, borderRadius:14, padding:"16px 20px", marginBottom:10, boxShadow:C.shadow, display:"flex", alignItems:"center", gap:14 }}>
+            <div style={{ width:36, height:36, borderRadius:8, background:C.surfaceLow, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0 }}>📄</div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontWeight:700, fontSize:14, color:C.onSurface, fontFamily:headline }}>{fp.name}</div>
+              <div style={{ fontSize:11, color:C.onSurfaceFaint, fontFamily:body, marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:480 }}>{fp.pdfUrl}</div>
+            </div>
+            <a href={fp.pdfUrl} target="_blank" rel="noreferrer" style={{ background:C.surfaceLow, borderRadius:8, padding:"7px 14px", color:C.onPrimaryFixed, fontSize:12, fontFamily:body, fontWeight:600, textDecoration:"none" }}>
+              Open ↗
+            </a>
+            <button
+              onClick={() => remove(fp.id)}
+              style={{ background:"none", border:"none", color:C.onSurfaceFaint, cursor:"pointer", fontSize:18, padding:"0 4px" }}
+            >
+              ×
+            </button>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
 // RECIPIENTS MANAGER
 // ─────────────────────────────────────────────────────────────────
 function RecipientsPanel({ recipients, onChange }) {
@@ -402,15 +743,18 @@ function ClashField({ label, field, type="text", opts, span=1, clash, onChange }
   );
 }
 
-function ClashCard({ clash, idx, onChange, onRemove, comments }) {
-  const [open, setOpen] = useState(idx===0);
+function ClashCard({ clash, idx, onChange, onRemove, comments, floorPlans }) {
+  const [open, setOpen]           = useState(idx===0);
+  const [showPinModal, setShowPin] = useState(false);
+  const [selectedPlanId, setSelectedPlanId] = useState(clash.floorPlanId || "");
   const cfg = PRI[clash.priority]||PRI.P1;
   const myComments = comments.filter(c=>c.clashKey===clash._key);
+  const activePlan = floorPlans?.find(fp => fp.id === (selectedPlanId || clash.floorPlanId));
+
   return (
     <div style={{
       background:C.surfaceLowest, borderRadius:14, overflow:"hidden",
       marginBottom:10, boxShadow:C.shadow,
-      /* 4px left-accent bar for P1 Critical */
       borderLeft: clash.priority==="P1" ? `4px solid ${C.error}` : `4px solid transparent`,
     }}>
       <div
@@ -422,6 +766,7 @@ function ClashCard({ clash, idx, onChange, onRemove, comments }) {
         }}>
         <div style={{ width:8, height:8, borderRadius:"50%", background:cfg.dot, flexShrink:0 }}/>
         <span style={{ color:C.onSurface, fontWeight:700, fontSize:14, flex:1, fontFamily:headline }}>{clash.id} — {clash.description||"New Clash"}</span>
+        {clash.pinX != null && <Tag color={C.onPrimaryFixed}>📍 Pinned</Tag>}
         {myComments.length>0 && <Tag color={C.onPrimaryFixed}>💬 {myComments.length}</Tag>}
         <PriBadge p={clash.priority}/><StatBadge s={clash.status}/>
         <span style={{ color:C.onSurfaceFaint, fontSize:16 }}>{open?"▲":"▼"}</span>
@@ -442,8 +787,67 @@ function ClashCard({ clash, idx, onChange, onRemove, comments }) {
             <ClashField label="DUE DATE"            field="dueDate"     type="date" clash={clash} onChange={onChange}/>
             <ClashField label="RESOLUTION NOTES"    field="notes"       type="textarea" span={2} clash={clash} onChange={onChange}/>
           </div>
+
+          {/* Screenshot */}
           <label style={FIELD_LBL}>SCREENSHOT — drop or click, auto-fits to frame</label>
           <ImgUpload value={clash.screenshot} onChange={v=>onChange("screenshot",v)}/>
+
+          {/* Floor Plan Pin */}
+          {floorPlans && floorPlans.length > 0 && (
+            <div style={{ marginTop:16 }}>
+              <label style={FIELD_LBL}>FLOOR PLAN PIN</label>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:10, alignItems:"center" }}>
+                <select
+                  value={selectedPlanId}
+                  onChange={e => {
+                    const val = e.target.value;
+                    setSelectedPlanId(val);
+                    onChange("floorPlanId", val || null);
+                    onChange("pinX", null);
+                    onChange("pinY", null);
+                  }}
+                  style={FIELD_INP}
+                >
+                  <option value="">— No floor plan —</option>
+                  {floorPlans.map(fp => <option key={fp.id} value={fp.id}>{fp.name}</option>)}
+                </select>
+                {selectedPlanId && (
+                  <button
+                    onClick={() => setShowPin(true)}
+                    style={{
+                      background: clash.pinX != null ? C.emeraldBg : C.primaryGrad,
+                      border: clash.pinX != null ? `1px solid ${C.emerald}` : "none",
+                      borderRadius:8, padding:"9px 18px",
+                      color: clash.pinX != null ? C.emerald : "#fff",
+                      fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:headline, whiteSpace:"nowrap",
+                    }}
+                  >
+                    {clash.pinX != null ? "📍 Move Pin" : "📍 Set Pin"}
+                  </button>
+                )}
+              </div>
+              {clash.pinX != null && activePlan && (
+                <div style={{ marginTop:8, background:C.emeraldBg, borderRadius:8, padding:"8px 14px", display:"flex", alignItems:"center", gap:8 }}>
+                  <span style={{ fontSize:14 }}>📍</span>
+                  <span style={{ fontSize:12, color:C.emerald, fontFamily:body }}>
+                    Pinned on <strong>{activePlan.name}</strong> at ({(clash.pinX*100).toFixed(1)}%, {(clash.pinY*100).toFixed(1)}%)
+                  </span>
+                  <button
+                    onClick={() => { onChange("pinX", null); onChange("pinY", null); }}
+                    style={{ marginLeft:"auto", background:"none", border:"none", color:C.error, cursor:"pointer", fontSize:11, fontFamily:body }}
+                  >
+                    ✕ Remove
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {floorPlans && floorPlans.length === 0 && (
+            <div style={{ marginTop:16, background:C.surfaceLow, borderRadius:10, padding:"10px 16px", fontSize:12, color:C.onSurfaceFaint, fontFamily:body }}>
+              💡 Add floor plans in the <strong>Floor Plans</strong> tab to pin this clash to a plan.
+            </div>
+          )}
 
           {myComments.length>0 && (
             <div style={{ marginTop:16 }}>
@@ -464,6 +868,18 @@ function ClashCard({ clash, idx, onChange, onRemove, comments }) {
           <button onClick={onRemove} style={{ marginTop:14, background:"none", borderRadius:8, padding:"8px 16px", color:C.error, cursor:"pointer", fontSize:12, fontFamily:body, border:"none" }}>✕ Remove clash</button>
         </div>
       )}
+
+      {/* Pin picker modal */}
+      {showPinModal && activePlan && (
+        <PinPickerModal
+          floorPlan={activePlan}
+          existingPin={clash.pinX != null ? { x: clash.pinX, y: clash.pinY } : null}
+          clashId={clash.id}
+          priority={clash.priority}
+          onConfirm={pin => { onChange("pinX", pin.x); onChange("pinY", pin.y); setShowPin(false); }}
+          onClose={() => setShowPin(false)}
+        />
+      )}
     </div>
   );
 }
@@ -480,7 +896,6 @@ function SendPanel({ project, clashes, onClose }) {
     if (project.recipients.length===0) { setMsg("Add at least one recipient first."); return; }
     setStatus("sending");
     try {
-      // Save report to Supabase
       const { data, error } = await supabase
         .from("reports")
         .insert({ project, clashes })
@@ -491,18 +906,24 @@ function SendPanel({ project, clashes, onClose }) {
       const url = `${APP_PUBLIC_URL}/?id=${data.id}`;
       setReportUrl(url);
 
-      const payload = {
+      const sharedFields = {
         project:project.name, cycle:project.cycle, client:project.client,
         coordinator:project.coordinator, date:project.date,
         totalClashes:clashes.length,
         p1:clashes.filter(c=>c.priority==="P1").length,
         p2:clashes.filter(c=>c.priority==="P2").length,
         p3:clashes.filter(c=>c.priority==="P3").length,
-        reportUrl: url, recipients:project.recipients,
+        reportUrl: url,
       };
+      // Send one webhook call per recipient so n8n $json has all fields flat
       try {
-        const res = await fetch(N8N_WEBHOOK_URL, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload) });
-        if (!res.ok) console.warn("n8n webhook failed:", res.status);
+        await Promise.all(project.recipients.map(r =>
+          fetch(N8N_WEBHOOK_URL, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({ ...sharedFields, ...r }),
+          }).catch(() => {})
+        ));
       } catch { console.warn("n8n not reachable"); }
 
       setStatus("done");
@@ -599,16 +1020,15 @@ function SendPanel({ project, clashes, onClose }) {
 // CLIENT COMMENT BOX
 // ─────────────────────────────────────────────────────────────────
 function CommentBox({ clashKey, comments, onAdd, reportId }) {
-  const [name, setName]   = useState("");
-  const [spec, setSpec]   = useState(SPECIALTIES[0]);
-  const [text, setText]   = useState("");
-  const [open, setOpen]   = useState(false);
+  const [name, setName]     = useState("");
+  const [spec, setSpec]     = useState(SPECIALTIES[0]);
+  const [text, setText]     = useState("");
+  const [open, setOpen]     = useState(false);
   const [saving, setSaving] = useState(false);
   const mine = comments.filter(c=>c.clashKey===clashKey);
   const submit = async () => {
     if (!text.trim()) return;
     if (reportId) {
-      // Client mode: save to Supabase
       setSaving(true);
       const { error } = await supabase.from("comments").insert({
         report_id: reportId, clash_id: clashKey,
@@ -641,10 +1061,10 @@ function CommentBox({ clashKey, comments, onAdd, reportId }) {
       ))}
       {!open ? (
         <button onClick={()=>setOpen(true)} style={{
-          background:"none", borderRadius:8, padding:"9px 18px",
+          background:C.surfaceContainer,
+          borderRadius:8, padding:"9px 18px",
           color:C.onSurfaceFaint, cursor:"pointer", fontSize:13,
           fontFamily:body, width:"100%", marginTop:mine.length>0?8:0, border:"none",
-          background:C.surfaceContainer,
         }}>
           💬 Add comment on this clash
         </button>
@@ -692,6 +1112,12 @@ function ReportView({ project, clashes, comments, onAddComment, onBack, reportId
   const p1=clashes.filter(c=>c.priority==="P1"), p2=clashes.filter(c=>c.priority==="P2"), p3=clashes.filter(c=>c.priority==="P3");
   const open=clashes.filter(c=>c.status==="Open").length;
   const resolved=clashes.filter(c=>["Resolved","Closed"].includes(c.status)).length;
+
+  const floorPlans = project.floorPlans || [];
+  // Only plans that have at least one pinned clash
+  const plansWithPins = floorPlans.filter(fp =>
+    clashes.some(c => c.floorPlanId === fp.id && c.pinX != null)
+  );
 
   const TH = ({children}) => <th style={{ background:C.navBg, color:"#fff", padding:"10px 14px", textAlign:"left", fontSize:11, letterSpacing:1.2, fontWeight:600, fontFamily:body }}>{children}</th>;
   const TD = ({children, center, mono:m}) => <td style={{ padding:"10px 14px", borderBottom:`1px solid ${C.surfaceHigh}`, fontSize:13, textAlign:center?"center":"left", fontFamily:m?body:"inherit", verticalAlign:"middle" }}>{children}</td>;
@@ -764,17 +1190,21 @@ function ReportView({ project, clashes, comments, onAddComment, onBack, reportId
         </div>
         <div className="fade-up" style={{ borderRadius:14, overflow:"hidden", marginBottom:8, overflowX:"auto", boxShadow:C.shadow }}>
           <table style={{ width:"100%", borderCollapse:"collapse" }}>
-            <thead><tr>{["ID","Priority","Disc A","Disc B","Description","Location","Status","Assigned"].map(h=><TH key={h}>{h}</TH>)}</tr></thead>
+            <thead><tr>{["ID","Priority","Disc A","Disc B","Description","Location","Status","Assigned","Plan"].map(h=><TH key={h}>{h}</TH>)}</tr></thead>
             <tbody>
-              {clashes.length===0 && <tr><td colSpan={8} style={{ padding:"20px", textAlign:"center", color:C.onSurfaceFaint, fontFamily:body }}>No clashes.</td></tr>}
-              {clashes.map((c,i)=>(
-                <tr key={c._key} style={{ background:i%2?C.surfaceLow:C.surfaceLowest }}>
-                  <TD mono>{c.id}</TD><TD><PriBadge p={c.priority}/></TD>
-                  <TD mono>{c.discA}</TD><TD mono>{c.discB}</TD>
-                  <TD>{c.description}</TD><TD>{c.location}</TD>
-                  <TD><StatBadge s={c.status}/></TD><TD>{c.assignedTo||"—"}</TD>
-                </tr>
-              ))}
+              {clashes.length===0 && <tr><td colSpan={9} style={{ padding:"20px", textAlign:"center", color:C.onSurfaceFaint, fontFamily:body }}>No clashes.</td></tr>}
+              {clashes.map((c,i)=>{
+                const plan = floorPlans.find(fp => fp.id === c.floorPlanId);
+                return (
+                  <tr key={c._key} style={{ background:i%2?C.surfaceLow:C.surfaceLowest }}>
+                    <TD mono>{c.id}</TD><TD><PriBadge p={c.priority}/></TD>
+                    <TD mono>{c.discA}</TD><TD mono>{c.discB}</TD>
+                    <TD>{c.description}</TD><TD>{c.location}</TD>
+                    <TD><StatBadge s={c.status}/></TD><TD>{c.assignedTo||"—"}</TD>
+                    <TD>{plan ? <span style={{ fontSize:11 }}>📍 {plan.name}</span> : <span style={{ color:C.onSurfaceFaint }}>—</span>}</TD>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -803,8 +1233,8 @@ function ReportView({ project, clashes, comments, onAddComment, onBack, reportId
                   ? <img src={c.screenshot} alt={c.id} style={{ width:"100%", height:"100%", objectFit:"contain" }}/>
                   : <div style={{ textAlign:"center", color:"rgba(255,255,255,0.3)" }}><div style={{ fontSize:40, marginBottom:8 }}>📸</div><p style={{ fontFamily:body, fontSize:13 }}>No screenshot</p></div>}
               </div>
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr" }}>
-                {[["Location",c.location||"—"],["Trades",`${c.discA} vs ${c.discB}`],["Model",c.modelFile||"—"]].map(([k,v])=>(
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr" }}>
+                {[["Location",c.location||"—"],["Trades",`${c.discA} vs ${c.discB}`],["Model",c.modelFile||"—"],["Floor Plan",floorPlans.find(fp=>fp.id===c.floorPlanId)?.name||(c.pinX!=null?"Pinned":"—")]].map(([k,v])=>(
                   <div key={k} style={{ padding:"12px 18px", background: C.surfaceLow }}>
                     <div style={{ fontSize:10, color:C.onSurfaceFaint, fontFamily:body, letterSpacing:1.5, marginBottom:4 }}>{k.toUpperCase()}</div>
                     <div style={{ fontSize:13, fontWeight:600, color:C.onSurface, fontFamily:headline }}>{v}</div>
@@ -824,9 +1254,76 @@ function ReportView({ project, clashes, comments, onAddComment, onBack, reportId
           );
         })}
 
+        {/* FLOOR PLAN OVERVIEW */}
+        {plansWithPins.length > 0 && (
+          <>
+            <div style={{ color:C.onSurface, fontWeight:800, fontSize:13, letterSpacing:2, margin:"40px 0 16px", display:"flex", alignItems:"center", gap:10 }} className="page-break fade-up">
+              <span style={{ color:C.error, fontSize:22, fontFamily:headline }}>04</span>
+              <span style={{ fontFamily:headline }}>FLOOR PLAN OVERVIEW</span>
+            </div>
+            <p className="fade-up" style={{ color:C.onSurfaceFaint, fontSize:13, fontFamily:body, margin:"0 0 24px" }}>
+              Clash locations pinned on the coordination plans. Colors match priority level.
+            </p>
+
+            {/* Priority legend for plans */}
+            <div className="fade-up" style={{ display:"flex", gap:16, marginBottom:24, flexWrap:"wrap" }}>
+              {Object.entries(PRI).map(([k, cfg]) => (
+                <div key={k} style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <div style={{ width:16, height:16, borderRadius:"50%", background:cfg.dot }}/>
+                  <span style={{ fontSize:12, fontFamily:body, color:C.onSurfaceMid, fontWeight:600 }}>{k} — {cfg.title}</span>
+                </div>
+              ))}
+            </div>
+
+            {plansWithPins.map(fp => {
+              const pinsOnPlan = clashes
+                .filter(c => c.floorPlanId === fp.id && c.pinX != null)
+                .map(c => ({ x: c.pinX, y: c.pinY, clashId: c.id, priority: c.priority }));
+
+              return (
+                <div key={fp.id} className="fade-up" style={{ background:C.surfaceLowest, borderRadius:14, overflow:"hidden", marginBottom:32, boxShadow:C.shadow }}>
+                  {/* Plan header */}
+                  <div style={{ padding:"14px 20px", background:C.navBg, display:"flex", alignItems:"center", gap:12 }}>
+                    <span style={{ fontSize:18 }}>🗺</span>
+                    <span style={{ color:"#fff", fontWeight:800, fontSize:15, fontFamily:headline }}>{fp.name}</span>
+                    <span style={{ color:"rgba(255,255,255,0.4)", fontSize:12, fontFamily:body }}>{pinsOnPlan.length} clash{pinsOnPlan.length!==1?"es":""} pinned</span>
+                  </div>
+
+                  {/* PDF with pins */}
+                  <div style={{ padding:20, background:C.surfaceLow }}>
+                    <PdfViewer url={fp.pdfUrl} pins={pinsOnPlan} />
+                  </div>
+
+                  {/* Pin legend */}
+                  <div style={{ padding:"16px 20px" }}>
+                    <div style={{ fontSize:10, color:C.onSurfaceFaint, fontFamily:body, letterSpacing:1.5, marginBottom:10 }}>PINNED CLASHES</div>
+                    <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
+                      {pinsOnPlan.map(pin => {
+                        const clash = clashes.find(c => c.id === pin.clashId);
+                        const cfg   = PRI[pin.priority] || PRI.P1;
+                        return (
+                          <div key={pin.clashId} style={{ display:"flex", alignItems:"center", gap:8, background:cfg.bg, borderRadius:8, padding:"6px 12px" }}>
+                            <div style={{ width:20, height:20, borderRadius:"50%", background:cfg.dot, display:"flex", alignItems:"center", justifyContent:"center" }}>
+                              <span style={{ color:"#fff", fontSize:9, fontWeight:700, fontFamily:body }}>{pin.clashId.split("-")[1]||pin.clashId}</span>
+                            </div>
+                            <div>
+                              <div style={{ fontSize:11, fontWeight:700, color:cfg.text, fontFamily:headline }}>{pin.clashId}</div>
+                              {clash?.description && <div style={{ fontSize:10, color:cfg.text, fontFamily:body, opacity:.8 }}>{clash.description}</div>}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </>
+        )}
+
         {/* RESOLUTION TABLE */}
         <div style={{ color:C.onSurface, fontWeight:800, fontSize:13, letterSpacing:2, margin:"40px 0 16px", display:"flex", alignItems:"center", gap:10 }} className="page-break fade-up">
-          <span style={{ color:C.error, fontSize:22, fontFamily:headline }}>04</span>
+          <span style={{ color:C.error, fontSize:22, fontFamily:headline }}>{plansWithPins.length > 0 ? "05" : "04"}</span>
           <span style={{ fontFamily:headline }}>RESOLUTION STATUS</span>
         </div>
         <div className="fade-up" style={{ borderRadius:14, overflow:"hidden", marginBottom:8, overflowX:"auto", boxShadow:C.shadow }}>
@@ -865,24 +1362,33 @@ function ReportView({ project, clashes, comments, onAddComment, onBack, reportId
 // ─────────────────────────────────────────────────────────────────
 // EDITOR SHELL
 // ─────────────────────────────────────────────────────────────────
-function Editor({ onLogout }) {
-  const [data, setData]         = useState(()=>load(STORAGE_REPORT,{ project:DEFAULT_PROJECT, clashes:[] }));
-  const [comments, setComments] = useState(()=>load(STORAGE_COMMENTS,[]));
+function Editor({ onLogout, projectId, onBack }) {
+  const [data, setData]         = useState(()=>load(STORAGE_REPORT(projectId),{ project:DEFAULT_PROJECT, clashes:[] }));
+  const [comments, setComments] = useState(()=>load(STORAGE_COMMENTS(projectId),[]));
   const [tab, setTab]           = useState("project");
   const [saved, setSaved]       = useState(false);
   const [sending, setSending]   = useState(false);
 
   const { project, clashes } = data;
 
-  const persist         = useCallback(next => { setData(next); save(STORAGE_REPORT, next); }, []);
-  const persistComments = c => { setComments(c); save(STORAGE_COMMENTS, c); };
+  const persist         = useCallback(arg => {
+    setData(prev => {
+      const next = typeof arg === "function" ? arg(prev) : arg;
+      save(STORAGE_REPORT(projectId), next);
+      return next;
+    });
+  }, [projectId]);
+  const persistComments = c => { setComments(c); save(STORAGE_COMMENTS(projectId), c); };
   const setProject      = (f,v) => persist({ ...data, project:{ ...project, [f]:v } });
   const setRecipients   = v     => persist({ ...data, project:{ ...project, recipients:v } });
+  const setFloorPlans   = v     => persist({ ...data, project:{ ...project, floorPlans:v } });
   const addClash        = ()    => persist({ ...data, clashes:[...clashes, mkClash()] });
-  const updClash        = (i,f,v) => { const c=[...clashes]; c[i]={...c[i],[f]:v}; persist({ ...data, clashes:c }); };
+  const updClash        = (i,f,v) => persist(prev => { const c=[...prev.clashes]; c[i]={...c[i],[f]:v}; return { ...prev, clashes:c }; });
   const delClash        = i     => persist({ ...data, clashes:clashes.filter((_,j)=>j!==i) });
   const addComment      = c     => persistComments([...comments, c]);
-  const manualSave      = ()    => { save(STORAGE_REPORT,data); setSaved(true); setTimeout(()=>setSaved(false),2000); };
+  const manualSave      = ()    => { save(STORAGE_REPORT(projectId),data); setSaved(true); setTimeout(()=>setSaved(false),2000); };
+
+  const floorPlans = project.floorPlans || [];
 
   const inp = {
     width:"100%", background:C.surfaceLow, borderRadius:8,
@@ -904,7 +1410,12 @@ function Editor({ onLogout }) {
           <div style={{ width:8, height:8, borderRadius:"50%", background:C.error }}/>
           <span style={{ color:C.error, fontWeight:800, fontSize:11, letterSpacing:3, fontFamily:headline }}>BIM EDGE</span>
         </div>
-        {[{k:"project",l:"① Project & Recipients"},{k:"clashes",l:`② Clashes (${clashes.length})`},{k:"comments_tab",l:`③ Comments (${comments.length})`}].map(({k,l})=>(
+        {[
+          {k:"project",      l:"① Project & Recipients"},
+          {k:"clashes",      l:`② Clashes (${clashes.length})`},
+          {k:"comments_tab", l:`③ Comments (${comments.length})`},
+          {k:"floorplans",   l:`④ Floor Plans (${floorPlans.length})`},
+        ].map(({k,l})=>(
           <button key={k} onClick={()=>setTab(k)} style={{
             background:"none", border:"none",
             borderBottom:`2px solid ${tab===k?"#fff":"transparent"}`,
@@ -924,6 +1435,7 @@ function Editor({ onLogout }) {
           }}>{saved?"✓ Saved":"💾 Save"}</button>
           <button onClick={()=>setTab("preview")} style={{ background:"rgba(73,124,255,0.15)", border:"none", borderRadius:8, padding:"8px 18px", color:"#97b4ff", cursor:"pointer", fontWeight:600, fontSize:13, fontFamily:headline }}>👁 Preview</button>
           <button onClick={()=>setSending(true)} style={{ background:C.primaryGrad, border:"none", borderRadius:8, padding:"8px 20px", color:"#fff", fontWeight:800, fontSize:13, cursor:"pointer", fontFamily:headline }}>📤 Send Report</button>
+          <button onClick={onBack} style={{ background:"none", border:"none", borderRadius:8, padding:"8px 14px", color:"rgba(255,255,255,0.3)", cursor:"pointer", fontSize:12, fontFamily:body }}>← Projects</button>
           <button onClick={onLogout} style={{ background:"none", border:"none", borderRadius:8, padding:"8px 14px", color:"rgba(255,255,255,0.3)", cursor:"pointer", fontSize:12, fontFamily:body }}>Logout</button>
         </div>
       </div>
@@ -991,7 +1503,13 @@ function Editor({ onLogout }) {
               </div>
             )}
             {clashes.map((c,i)=>(
-              <ClashCard key={c._key} clash={c} idx={i} onChange={(f,v)=>updClash(i,f,v)} onRemove={()=>delClash(i)} comments={comments}/>
+              <ClashCard
+                key={c._key} clash={c} idx={i}
+                onChange={(f,v)=>updClash(i,f,v)}
+                onRemove={()=>delClash(i)}
+                comments={comments}
+                floorPlans={floorPlans}
+              />
             ))}
             {clashes.length>0 && (
               <button onClick={addClash} style={{ width:"100%", background:C.surfaceLowest, borderRadius:10, padding:16, color:C.onSurfaceFaint, cursor:"pointer", fontSize:14, fontFamily:headline, marginTop:4, boxShadow:C.shadow, border:"none" }}>+ Add Another Clash</button>
@@ -1039,6 +1557,12 @@ function Editor({ onLogout }) {
             })}
           </div>
         )}
+
+        {/* FLOOR PLANS TAB */}
+        {tab==="floorplans" && (
+          <FloorPlansTab floorPlans={floorPlans} onChange={setFloorPlans} />
+        )}
+
       </div>
     </div>
   );
@@ -1048,7 +1572,7 @@ function Editor({ onLogout }) {
 // CLIENT VIEW — loads report from Supabase by ID
 // ─────────────────────────────────────────────────────────────────
 function ClientView({ reportId }) {
-  const [state, setState] = useState("loading"); // loading | ready | error
+  const [state, setState]     = useState("loading");
   const [project, setProject] = useState(null);
   const [clashes, setClashes] = useState([]);
   const [comments, setComments] = useState([]);
@@ -1100,14 +1624,131 @@ function ClientView({ reportId }) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// PROJECT SELECTOR
+// ─────────────────────────────────────────────────────────────────
+function ProjectSelector({ onSelect, onLogout }) {
+  const [projects, setProjects] = useState(() => {
+    const existing = load(STORAGE_PROJECTS, []);
+    // Migrate old single-project storage if exists and no projects yet
+    if (existing.length === 0) {
+      const oldData = load("bim_report_v2", null);
+      if (oldData && (oldData.project?.name || oldData.clashes?.length > 0)) {
+        const migrated = { id: "migrated", name: oldData.project?.name || "My Project", createdAt: new Date().toISOString() };
+        save(STORAGE_REPORT("migrated"), oldData);
+        const oldComments = load("bim_comments_v2", []);
+        save(STORAGE_COMMENTS("migrated"), oldComments);
+        save(STORAGE_PROJECTS, [migrated]);
+        return [migrated];
+      }
+    }
+    return existing;
+  });
+  const [newName, setNewName]   = useState("");
+  const [confirm, setConfirm]   = useState(null); // id to delete
+
+  const saveProjects = p => { setProjects(p); save(STORAGE_PROJECTS, p); };
+
+  const createProject = () => {
+    const name = newName.trim();
+    if (!name) return;
+    const p = { id: Date.now().toString(36), name, createdAt: new Date().toISOString() };
+    const next = [...projects, p];
+    saveProjects(next);
+    setNewName("");
+    onSelect(p.id);
+  };
+
+  const deleteProject = id => {
+    try { localStorage.removeItem(STORAGE_REPORT(id)); } catch {}
+    try { localStorage.removeItem(STORAGE_COMMENTS(id)); } catch {}
+    saveProjects(projects.filter(p => p.id !== id));
+    setConfirm(null);
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.surface, fontFamily:body }}>
+      <style>{GLOBAL_CSS}</style>
+
+      {/* NAV */}
+      <div style={{ background:C.navBg, display:"flex", alignItems:"center", padding:"0 32px", height:56 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <div style={{ width:8, height:8, borderRadius:"50%", background:C.error }}/>
+          <span style={{ color:C.error, fontWeight:800, fontSize:11, letterSpacing:3, fontFamily:headline }}>BIM EDGE</span>
+        </div>
+        <div style={{ flex:1 }}/>
+        <button onClick={onLogout} style={{ background:"none", border:"none", color:"rgba(255,255,255,0.3)", cursor:"pointer", fontSize:12, fontFamily:body }}>Logout</button>
+      </div>
+
+      <div style={{ maxWidth:640, margin:"0 auto", padding:"48px 24px" }}>
+        <h2 style={{ fontFamily:headline, fontSize:28, fontWeight:800, color:C.onSurface, margin:"0 0 6px" }}>Projects</h2>
+        <p style={{ color:C.onSurfaceFaint, fontSize:13, fontFamily:body, margin:"0 0 32px" }}>Select a project to edit or create a new one.</p>
+
+        {/* Create new */}
+        <div style={{ display:"flex", gap:10, marginBottom:32 }}>
+          <input
+            value={newName}
+            onChange={e => setNewName(e.target.value)}
+            onKeyDown={e => e.key==="Enter" && createProject()}
+            placeholder="New project name…"
+            style={{ flex:1, background:C.surfaceLowest, border:`1px solid ${C.surfaceHigh}`, borderRadius:10, padding:"11px 16px", fontSize:14, color:C.onSurface, fontFamily:body }}
+          />
+          <button
+            onClick={createProject}
+            disabled={!newName.trim()}
+            style={{ background:newName.trim()?C.primaryGrad:C.surfaceHigh, border:"none", borderRadius:10, padding:"11px 24px", color:newName.trim()?"#fff":C.onSurfaceFaint, fontWeight:800, fontSize:14, cursor:newName.trim()?"pointer":"default", fontFamily:headline }}
+          >
+            + Create
+          </button>
+        </div>
+
+        {/* Projects list */}
+        {projects.length === 0 ? (
+          <div style={{ background:C.surfaceLowest, borderRadius:16, padding:"60px 40px", textAlign:"center", boxShadow:C.shadow }}>
+            <div style={{ fontSize:44, marginBottom:12 }}>📁</div>
+            <p style={{ color:C.onSurfaceFaint, fontFamily:body }}>No projects yet. Create one above.</p>
+          </div>
+        ) : (
+          projects.map(p => (
+            <div key={p.id} style={{ background:C.surfaceLowest, borderRadius:14, padding:"18px 24px", marginBottom:10, boxShadow:C.shadow, display:"flex", alignItems:"center", gap:14 }}>
+              <div style={{ flex:1 }}>
+                <div style={{ fontWeight:700, fontSize:15, fontFamily:headline, color:C.onSurface }}>{p.name}</div>
+                <div style={{ fontSize:11, color:C.onSurfaceFaint, fontFamily:body, marginTop:2 }}>
+                  Created {new Date(p.createdAt).toLocaleDateString()}
+                </div>
+              </div>
+              <button
+                onClick={() => onSelect(p.id)}
+                style={{ background:C.primaryGrad, border:"none", borderRadius:8, padding:"9px 20px", color:"#fff", fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:headline }}
+              >
+                Open →
+              </button>
+              {confirm === p.id ? (
+                <div style={{ display:"flex", gap:6 }}>
+                  <button onClick={() => deleteProject(p.id)} style={{ background:C.error, border:"none", borderRadius:8, padding:"9px 14px", color:"#fff", fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:body }}>Delete</button>
+                  <button onClick={() => setConfirm(null)} style={{ background:C.surfaceLow, border:"none", borderRadius:8, padding:"9px 14px", color:C.onSurfaceMid, fontWeight:600, fontSize:12, cursor:"pointer", fontFamily:body }}>Cancel</button>
+                </div>
+              ) : (
+                <button onClick={() => setConfirm(p.id)} style={{ background:"none", border:`1px solid ${C.surfaceHigh}`, borderRadius:8, padding:"9px 14px", color:C.error, fontWeight:600, fontSize:12, cursor:"pointer", fontFamily:body }}>🗑</button>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
 // ADMIN SHELL — wraps auth + editor
 // ─────────────────────────────────────────────────────────────────
 function AdminShell() {
-  const [authed, setAuthed] = useState(()=>{ try{ return sessionStorage.getItem("bim_authed")==="1"; }catch{ return false; } });
+  const [authed, setAuthed]         = useState(()=>{ try{ return sessionStorage.getItem("bim_authed")==="1"; }catch{ return false; } });
+  const [projectId, setProjectId]   = useState(null);
   const login  = ()=>{ try{ sessionStorage.setItem("bim_authed","1"); }catch{} setAuthed(true); };
-  const logout = ()=>{ try{ sessionStorage.removeItem("bim_authed"); }catch{} setAuthed(false); };
+  const logout = ()=>{ try{ sessionStorage.removeItem("bim_authed"); }catch{} setAuthed(false); setProjectId(null); };
   if (!authed) return <Login onLogin={login}/>;
-  return <Editor onLogout={logout}/>;
+  if (!projectId) return <ProjectSelector onSelect={setProjectId} onLogout={logout}/>;
+  return <Editor onLogout={logout} projectId={projectId} onBack={() => setProjectId(null)}/>;
 }
 
 // ─────────────────────────────────────────────────────────────────

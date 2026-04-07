@@ -10,7 +10,10 @@
       "Bash(findstr LISTENING)",
       "Bash(tailscale status:*)",
       "Bash(powershell -Command '$input | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object HostName, DNSName, TailscaleIPs, ExitNode, ExitNodeOption, AdvertisedRoutes | Format-List')",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(findstr :4173)",
+      "Bash(taskkill /PID 49904 /F)",
+      "Bash(cmd /c \"taskkill /PID 49904 /F\")"
     ]
   }
 }
