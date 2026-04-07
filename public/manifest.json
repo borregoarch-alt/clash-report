@@ -1,0 +1,18 @@
+{
+  "name": "BIM Edge Clash Report",
+  "short_name": "Clash Report",
+  "description": "BIM Edge Solutions — Clash Detection Report Manager",
+  "start_url": "/clash-report/",
+  "scope": "/clash-report/",
+  "display": "standalone",
+  "background_color": "#0d1c2f",
+  "theme_color": "#0d1c2f",
+  "icons": [
+    {
+      "src": "/clash-report/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
